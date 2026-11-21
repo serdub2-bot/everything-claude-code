@@ -2081,6 +2081,49 @@ async function runTests() {
   console.log('\nShell wrapper portability:');
 
   if (
+    test('run-with-flags.js dispatches .sh hooks through a resolved bash (Git Bash vs WSL)', () => {
+      const src = fs.readFileSync(path.join(scriptsDir, 'run-with-flags.js'), 'utf8');
+      assert.ok(src.includes("endsWith('.sh')"), 'run-with-flags.js should branch on .sh hook scripts');
+      assert.ok(src.includes('resolveWindowsBash'), 'run-with-flags.js should resolve a Windows bash deliberately');
+      assert.ok(src.includes('/mnt/'), 'run-with-flags.js should rewrite drive paths for WSL bash');
+      assert.ok(/system32/i.test(src), 'run-with-flags.js should detect the WSL bash launcher in System32');
+      assert.ok(src.includes('CLAUDE_CODE_GIT_BASH_PATH'), 'run-with-flags.js should honor CLAUDE_CODE_GIT_BASH_PATH');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    await asyncTest('run-with-flags.js runs .sh hooks via bash and forwards extra args', async () => {
+      const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-sh-hook-'));
+      fs.mkdirSync(path.join(tmpRoot, 'hooks'), { recursive: true });
+      fs.writeFileSync(path.join(tmpRoot, 'hooks', 'phase.sh'), '#!/bin/bash\necho "SHOK:$1"\n');
+
+      const result = spawnSync('node', [
+        path.join(scriptsDir, 'run-with-flags.js'),
+        'test:sh-hook',
+        'hooks/phase.sh',
+        'minimal,standard,strict',
+        'pre'
+      ], {
+        input: '{"x":1}',
+        encoding: 'utf8',
+        env: { ...process.env, CLAUDE_PLUGIN_ROOT: tmpRoot }
+      });
+
+      assert.strictEqual(result.status, 0, `should exit 0, stderr: ${result.stderr}`);
+      // When bash is resolvable the hook output appears; otherwise the runner
+      // must pass stdin through untouched (non-blocking by design).
+      assert.ok(
+        result.stdout.includes('SHOK:pre') || result.stdout === '{"x":1}',
+        `expected hook output or passthrough, got: ${result.stdout.slice(0, 200)}`
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
     test('run-with-flags-shell resolves plugin root when CLAUDE_PLUGIN_ROOT is unset', () => {
       const wrapperSource = fs.readFileSync(path.join(scriptsDir, 'run-with-flags-shell.sh'), 'utf8');
       assert.ok(wrapperSource.includes('PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-'), 'Shell wrapper should derive PLUGIN_ROOT from its own script path');

@@ -3,7 +3,12 @@
  * Executes a hook script only when enabled by ECC hook profile flags.
  *
  * Usage:
- *   node run-with-flags.js <hookId> <scriptRelativePath> [profilesCsv]
+ *   node run-with-flags.js <hookId> <scriptRelativePath> [profilesCsv] [extraArgs...]
+ *
+ * .js hooks run under Node; .sh hooks run under a resolved bash
+ * (Git Bash or WSL bash on Windows — see resolveWindowsBash).
+ * Extra args after profilesCsv are forwarded to the hook script
+ * (e.g. "pre"/"post" for hooks that need their phase).
  */
 
 'use strict';
@@ -28,6 +33,72 @@ function readStdinRaw() {
     process.stdin.on('end', () => resolve(raw));
     process.stdin.on('error', () => resolve(raw));
   });
+}
+
+// Convert a Windows path like C:\dir\file to the /mnt/c/dir/file form
+// understood inside WSL, or /c/dir/file for MSYS/Git Bash.
+function driveLetterTo(prefix, winPath) {
+  const m = /^([A-Za-z]):[\\\/]([\s\S]*)$/.exec(winPath);
+  if (!m) return winPath;
+  return `${prefix}${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
+}
+const toWslPath = p => driveLetterTo('/mnt/', p);
+const toMsysPath = p => driveLetterTo('/', p);
+
+// Locate a bash that can run *.sh hooks on Windows.
+// WSL's bash.exe only understands /mnt/<drive>/ paths; Git Bash uses /c/
+// paths, so the flavor determines how the script path must be rewritten.
+function resolveWindowsBash() {
+  const candidates = [process.env.CLAUDE_CODE_GIT_BASH_PATH, process.env.GIT_BASH_PATH].filter(Boolean);
+
+  try {
+    const whereGit = spawnSync('where.exe', ['git.exe'], { encoding: 'utf8' });
+    const gitExe = (whereGit.stdout || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0];
+    if (gitExe) {
+      candidates.push(path.join(path.dirname(gitExe), '..', 'bin', 'bash.exe'));
+    }
+  } catch {
+    /* where.exe missing — keep going */
+  }
+
+  candidates.push(
+    'C:\\Program Files\\Git\\bin\\bash.exe',
+    'C:\\Program Files (x86)\\Git\\bin\\bash.exe'
+  );
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return { cmd: candidate, flavor: 'msys' };
+    } catch {
+      /* keep looking */
+    }
+  }
+
+  // Fall back to whatever `bash` resolves to on PATH. The WSL launcher lives
+  // in System32; anything else is assumed to be an MSYS-style bash.
+  try {
+    const whereBash = spawnSync('where.exe', ['bash.exe'], { encoding: 'utf8' });
+    const bashExe = (whereBash.stdout || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0];
+    if (bashExe) {
+      const isWslLauncher = /system32\\bash\.exe$/i.test(bashExe);
+      return { cmd: bashExe, flavor: isWslLauncher ? 'wsl' : 'msys' };
+    }
+  } catch {
+    /* no bash on PATH */
+  }
+
+  return null;
+}
+
+// Returns { cmd, argPath } for spawning a .sh hook, or null when no bash exists.
+function resolveShellRunner(scriptPath) {
+  if (process.platform !== 'win32') {
+    return { cmd: 'bash', argPath: scriptPath };
+  }
+  const bash = resolveWindowsBash();
+  if (!bash) return null;
+  const argPath = bash.flavor === 'wsl' ? toWslPath(scriptPath) : toMsysPath(scriptPath);
+  return { cmd: bash.cmd, argPath };
 }
 
 function getPluginRoot() {
@@ -68,6 +139,32 @@ async function main() {
     process.exit(0);
   }
 
+  const extraArgs = process.argv.slice(5);
+
+  // Shell hooks (*.sh) run under bash. On Windows the right interpreter and
+  // path form differ between Git Bash (/c/...) and WSL bash (/mnt/c/...);
+  // resolveShellRunner picks both. Without a bash, pass input through.
+  if (scriptPath.toLowerCase().endsWith('.sh')) {
+    const shell = resolveShellRunner(scriptPath);
+    if (!shell) {
+      process.stderr.write(`[Hook] No bash found for ${hookId}; passing input through\n`);
+      process.stdout.write(raw);
+      process.exit(0);
+    }
+
+    const shResult = spawnSync(shell.cmd, [shell.argPath, ...extraArgs], {
+      input: raw,
+      encoding: 'utf8',
+      env: process.env,
+      cwd: process.cwd(),
+      timeout: 30000
+    });
+
+    if (shResult.stdout) process.stdout.write(shResult.stdout);
+    if (shResult.stderr) process.stderr.write(shResult.stderr);
+    process.exit(Number.isInteger(shResult.status) ? shResult.status : 0);
+  }
+
   // Prefer direct require() when the hook exports a run(rawInput) function.
   // This eliminates one Node.js process spawn (~50-100ms savings per hook).
   //
@@ -99,7 +196,7 @@ async function main() {
   }
 
   // Legacy path: spawn a child Node process for hooks without run() export
-  const result = spawnSync('node', [scriptPath], {
+  const result = spawnSync('node', [scriptPath, ...extraArgs], {
     input: raw,
     encoding: 'utf8',
     env: process.env,
